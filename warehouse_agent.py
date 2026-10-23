@@ -1198,7 +1198,8 @@ def _llm_chat(messages, tools=None):
             if r.status_code == 400 and "reasoning" in txt and "reasoning_effort" in body:
                 drop_reasoning = True
                 continue
-            model_problem = r.status_code == 404 or (r.status_code in (400, 403) and re.search(r'model|decommission|deprecat|not found|not supported|tool', txt))
+            model_problem = r.status_code == 404 or (r.status_code in (400, 403) and 'thought_signature' not in txt and re.search(
+                r'model.*(not found|not supported|decommission|deprecat|does not exist|invalid|unavailable)|(does not|doesn.t|not) support.*tool|tool.*not supported', txt))
             if model_problem and not LLM_MODEL_PINNED and attempt < 2:
                 print(f"[llm] model '{model}' rejected ({r.status_code}); trying the next one")
                 _next_model()
@@ -1679,8 +1680,11 @@ def run_agent(user_query, sid):
             fn = call.get("function") or {}
             nm = re.sub(r"<\|.*?\|>", "", str(fn.get("name") or "")).strip().split(".")[-1]
             raw = fn.get("arguments")
-            norm.append({"id": call.get("id") or f"call_{k}", "type": "function",
-                         "function": {"name": nm, "arguments": raw if isinstance(raw, str) else json.dumps(raw or {})}})
+            entry = dict(call)                       # keep unknown fields, e.g. Gemini's extra_content.google.thought_signature
+            entry.pop("index", None)
+            entry.update({"id": call.get("id") or f"call_{k}", "type": "function",
+                          "function": {**fn, "name": nm, "arguments": raw if isinstance(raw, str) else json.dumps(raw or {})}})
+            norm.append(entry)
         calls = norm
         messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
         for call in calls:
