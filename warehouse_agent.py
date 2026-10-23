@@ -624,7 +624,9 @@ LLM_PROVIDER = os.environ.get('LLM_PROVIDER', '').strip().lower()
 if not LLM_PROVIDER:
     LLM_PROVIDER = 'custom' if os.environ.get('LLM_BASE_URL') else ('groq' if LLM_API_KEY else 'offline')
 LLM_URL = os.environ.get('LLM_BASE_URL') or LLM_PRESETS.get(LLM_PROVIDER)
-LLM_MODEL_PINNED = os.environ.get('LLM_MODEL') or os.environ.get('GROQ_MODEL') or (
+_m = (os.environ.get('LLM_MODEL') or os.environ.get('GROQ_MODEL') or '').strip()
+_m = '' if _m.lower() in ('auto', '-', 'none', 'default') else _m   # "auto" = let the app discover a model
+LLM_MODEL_PINNED = _m or (
     'qwen2.5:7b' if LLM_PROVIDER == 'ollama' and not os.environ.get('LLM_AUTO_MODEL') else None)
 LLM_MODEL = LLM_MODEL_PINNED          # kept for older references; None means "auto-discover"
 LLM_ENABLED = bool(LLM_PROVIDER != 'offline' and LLM_URL and (LLM_PROVIDER in ('ollama', 'custom') or LLM_API_KEY))
@@ -1076,9 +1078,10 @@ or requested; never propose bulk changes the user did not ask for. Always pass a
 # ---------- LLM call with tools: provider-agnostic, auto model discovery + failover ----------
 _BAD_MODEL = re.compile(r'whisper|tts|embed|guard|moderat|image|vision|audio|speech|transcri|rerank|imagen|veo|live|dall|safeguard|nano-banana', re.I)
 _PREFERRED = [r'gpt-oss-120b', r'gpt-oss-20b', r'llama-?3\.3-70b', r'qwen3?.*(?:32b|30b|27b|235b)',
-              r'gemini.*flash(?!.*lite)', r'gemini', r'llama', r'mistral|mixtral', r'qwen', r'deepseek']
+              r'gemini.*flash(?!.*lite)', r'gemini.*flash.*lite', r'gemini', r'llama', r'mistral|mixtral', r'qwen', r'deepseek']
 _MODELS = {"candidates": None, "i": 0}
 _LLM_USE = {"day": None, "n": 0}
+LLM_TIMEOUT = float(os.environ.get('LLM_TIMEOUT', '35'))             # seconds to wait for each model reply
 LLM_DAILY_LIMIT = int(os.environ.get('LLM_DAILY_LIMIT', '400'))   # protects a free quota on a public demo
 _LLM_LOCK = threading.Lock()
 
@@ -1094,7 +1097,7 @@ def _discover_models():
     """Ask the provider which models it currently serves (model names change; don't hardcode)."""
     out = []
     try:
-        r = requests.get(LLM_URL.replace("/chat/completions", "/models"), headers=_auth_headers(), timeout=15)
+        r = requests.get(LLM_URL.replace("/chat/completions", "/models"), headers=_auth_headers(), timeout=10)
         r.raise_for_status()
         j = r.json()
         for m in (j.get("data") or j.get("models") or []):
@@ -1111,7 +1114,8 @@ def _discover_models():
         _MODELS["auth_error"] = code in (401, 403)
         print(f"[llm] model discovery failed: {e}")
     rank = lambda mid: next((i for i, rx in enumerate(_PREFERRED) if re.search(rx, mid, re.I)), 99)
-    out = sorted(dict.fromkeys(out), key=rank)
+    slow = lambda mid: 1 if re.search(r'pro|think|reason|deep|r1|exp(?:erimental)?\b|preview|latest', mid, re.I) else 0
+    out = sorted(dict.fromkeys(out), key=lambda m: (rank(m), slow(m)))
     default = {"groq": "openai/gpt-oss-20b"}.get(LLM_PROVIDER)
     if default and default in out:
         out.remove(default); out.insert(0, default)
@@ -1151,7 +1155,8 @@ def _llm_chat(messages, tools=None):
     if not _budget_ok():
         return None, "the demo's daily AI quota is used up (it resets tomorrow)."
     headers = _auth_headers()
-    for attempt in range(3):
+    drop_reasoning = False
+    for attempt in range(4):
         model = current_model()
         if not model:
             if _MODELS.get("auth_error"):
@@ -1161,9 +1166,15 @@ def _llm_chat(messages, tools=None):
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+        if LLM_PROVIDER == "gemini" and not drop_reasoning:
+            body["reasoning_effort"] = "low"          # keeps Gemini fast; dropped automatically if rejected
         try:
-            r = requests.post(LLM_URL, headers=headers, json=body, timeout=180 if LLM_PROVIDER == 'ollama' else 45)
+            r = requests.post(LLM_URL, headers=headers, json=body,
+                              timeout=(10, 180) if LLM_PROVIDER == 'ollama' else (10, LLM_TIMEOUT))
             txt = r.text[:300].lower()
+            if r.status_code == 400 and "reasoning" in txt and "reasoning_effort" in body:
+                drop_reasoning = True
+                continue
             model_problem = r.status_code == 404 or (r.status_code in (400, 403) and re.search(r'model|decommission|deprecat|not found|not supported|tool', txt))
             if model_problem and not LLM_MODEL_PINNED and attempt < 2:
                 print(f"[llm] model '{model}' rejected ({r.status_code}); trying the next one")
@@ -1180,7 +1191,11 @@ def _llm_chat(messages, tools=None):
             r.raise_for_status()
             return r.json()["choices"][0]["message"], None
         except requests.exceptions.Timeout:
-            return None, "the AI provider timed out."
+            if not LLM_MODEL_PINNED and attempt < 2:
+                print(f"[llm] model '{model}' timed out; trying the next one")
+                _next_model()
+                continue
+            return None, f"the AI provider timed out (model: {model})."
         except requests.exceptions.ConnectionError:
             return None, ("can't connect to Ollama — is it running?" if LLM_PROVIDER == 'ollama'
                           else "can't reach the AI provider (network/DNS).")
@@ -4428,6 +4443,29 @@ def agent_decide(aid, decision):
     _history(sid).append({"role": "user", "content":
         f"(System note: the user {decision}d the proposed action \"{act['summary']}\". Result: {msg})"})
     return jsonify({"status": act['status'], "message": msg})
+
+@app.route('/api/agent/selftest')
+def agent_selftest():
+    """Open this URL in a browser to see exactly why the AI is (not) working. Never shows the key."""
+    import time as _tm
+    info = {"provider": LLM_PROVIDER, "enabled": LLM_ENABLED, "api_key_set": bool(LLM_API_KEY),
+            "pinned_model": LLM_MODEL_PINNED, "url": LLM_URL}
+    if not LLM_ENABLED:
+        info["problem"] = LLM_PROBLEM or "No provider configured (offline mode)."
+        return jsonify(info)
+    t = _tm.time()
+    with _LLM_LOCK:
+        if _MODELS["candidates"] is None:
+            found = _discover_models()
+            _MODELS["candidates"] = found or None
+        info["models_found"] = (_MODELS["candidates"] or [])[:12]
+    info["discovery_seconds"] = round(_tm.time() - t, 1)
+    info["auth_error"] = bool(_MODELS.get("auth_error"))
+    t = _tm.time()
+    msg, err = _llm_chat([{"role": "user", "content": "Reply with the single word OK."}])
+    info.update(chat_seconds=round(_tm.time() - t, 1), model_used=current_model(),
+                reply=((msg or {}).get("content") or "")[:80], error=err, ok=bool(msg and not err))
+    return jsonify(info)
 
 @app.route('/api/agent/status')
 def agent_status():
