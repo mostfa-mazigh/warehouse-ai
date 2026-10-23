@@ -1,0 +1,36 @@
+# Render Blueprint — New > Blueprint > pick your GitHub repo.
+# NOTE: free instances have an EPHEMERAL disk: the SQLite database resets on every restart/sleep/redeploy.
+services:
+  - type: web
+    name: warehouse-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # ONE worker: containers/pending actions live in memory. Threads give concurrency.
+    startCommand: gunicorn warehouse_agent:app --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: WAREHOUSE_ACCESS_TOKEN
+        generateValue: true
+      - key: WAREHOUSE_SECRET_KEY
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: PUBLIC_MODE
+        value: "1"
+      # --- SUBMISSION / DEMO SETTINGS ---
+      - key: DEMO_SEED            # fill the (ephemeral) database with realistic demo data on every start
+        value: "1"
+      - key: DEMO_OPEN_ACCESS     # reviewers open the plain URL; no secret link needed
+        value: "1"
+      - key: LLM_DAILY_LIMIT      # cap AI calls per day so a public link can't drain your free quota
+        value: "300"
+      # AI provider. Use one of: groq | gemini | openrouter | cerebras (omit all three to run offline).
+      # LLM_MODEL is optional: leave it empty and the app discovers a working model itself.
+      - key: LLM_PROVIDER
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false

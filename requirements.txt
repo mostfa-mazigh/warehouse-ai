@@ -1,0 +1,8 @@
+flask>=3.0
+qrcode>=7.4
+pillow>=10.0
+requests>=2.31
+python-dotenv>=1.0
+gunicorn>=22.0
+# scikit-learn is OPTIONAL (only used for fuzzy search; a built-in fallback is used if absent).
+# Leave it out on small free hosts to keep builds fast and memory low.
