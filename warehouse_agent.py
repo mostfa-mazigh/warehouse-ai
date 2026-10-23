@@ -1078,12 +1078,13 @@ or requested; never propose bulk changes the user did not ask for. Always pass a
 # ---------- LLM call with tools: provider-agnostic, auto model discovery + failover ----------
 _BAD_MODEL = re.compile(r'whisper|tts|embed|guard|moderat|image|vision|audio|speech|transcri|rerank|imagen|veo|live|dall|safeguard|nano-banana', re.I)
 _PREFERRED = [r'gpt-oss-120b', r'gpt-oss-20b', r'llama-?3\.3-70b', r'qwen3?.*(?:32b|30b|27b|235b)',
-              r'gemini.*flash(?!.*lite)', r'gemini.*flash.*lite', r'gemini', r'llama', r'mistral|mixtral', r'qwen', r'deepseek']
+              r'gemini.*flash.*lite', r'gemini.*flash(?!.*lite)', r'gemini', r'llama', r'mistral|mixtral', r'qwen', r'deepseek']
 _MODELS = {"candidates": None, "i": 0}
 _LLM_USE = {"day": None, "n": 0}
 LLM_TIMEOUT = float(os.environ.get('LLM_TIMEOUT', '35'))             # seconds to wait for each model reply
 LLM_DAILY_LIMIT = int(os.environ.get('LLM_DAILY_LIMIT', '400'))   # protects a free quota on a public demo
 _LLM_LOCK = threading.Lock()
+_COOL = {}     # model -> epoch time until which it is skipped (after a 429)
 
 
 def _auth_headers():
@@ -1130,7 +1131,11 @@ def current_model():
             found = _discover_models()
             _MODELS["candidates"] = found if found else None      # empty -> retry on the next call
         c = _MODELS["candidates"] or []
-        return c[_MODELS["i"]] if _MODELS["i"] < len(c) else None
+        now = _time.time()
+        for m in c[_MODELS["i"]:]:
+            if _COOL.get(m, 0) <= now:
+                return m
+        return None
 
 
 def _next_model():
@@ -1156,8 +1161,13 @@ def _llm_chat(messages, tools=None):
         return None, "the demo's daily AI quota is used up (it resets tomorrow)."
     headers = _auth_headers()
     drop_reasoning = False
+    if LLM_MODEL_PINNED and _COOL.get(LLM_MODEL_PINNED, 0) > _time.time():
+        return None, f"provider rate limit (429): '{LLM_MODEL_PINNED}' is cooling down, retry in ~{int(_COOL[LLM_MODEL_PINNED] - _time.time())}s."
     for attempt in range(4):
         model = current_model()
+        if not model and _MODELS["candidates"]:
+            wait = int(max(1, min(_COOL.values(), default=0) - _time.time()))
+            return None, f"provider rate limit (429): every model is cooling down, retry in ~{wait}s."
         if not model:
             if _MODELS.get("auth_error"):
                 return None, "the provider rejected the API key (401/403) — check LLM_API_KEY."
@@ -1172,6 +1182,19 @@ def _llm_chat(messages, tools=None):
             r = requests.post(LLM_URL, headers=headers, json=body,
                               timeout=(10, 180) if LLM_PROVIDER == 'ollama' else (10, LLM_TIMEOUT))
             txt = r.text[:300].lower()
+            if r.status_code == 429:
+                if re.search(r'per ?day|daily|limit: ?0|exhausted', txt):
+                    secs = 3600
+                else:
+                    try:
+                        secs = max(5, min(float(r.headers.get("Retry-After", 60)), 300))
+                    except ValueError:
+                        secs = 60
+                _COOL[model] = _time.time() + secs
+                if not LLM_MODEL_PINNED and attempt < 3:
+                    print(f"[llm] model '{model}' is rate-limited (429); cooling it for {int(secs)}s and trying the next one")
+                    continue
+                return None, f"provider rate limit (429) on '{model}'; retry in ~{int(secs)}s."
             if r.status_code == 400 and "reasoning" in txt and "reasoning_effort" in body:
                 drop_reasoning = True
                 continue
@@ -4461,6 +4484,7 @@ def agent_selftest():
         info["models_found"] = (_MODELS["candidates"] or [])[:12]
     info["discovery_seconds"] = round(_tm.time() - t, 1)
     info["auth_error"] = bool(_MODELS.get("auth_error"))
+    info["cooling_down_seconds"] = {m: int(t - _tm.time()) for m, t in _COOL.items() if t > _tm.time()}
     t = _tm.time()
     msg, err = _llm_chat([{"role": "user", "content": "Reply with the single word OK."}])
     info.update(chat_seconds=round(_tm.time() - t, 1), model_used=current_model(),
